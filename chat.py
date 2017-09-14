@@ -1,10 +1,12 @@
-import sys, os, pickle
+import sys, os, atexit, pickle, pdb
 import socket, socketserver
 from concurrent.futures import ThreadPoolExecutor, wait
 
+from dictdb import DictDB
+
 PROMT = "%s> "
-PEERS_PATH = \
-    "peers.txt" # Список текущих чат-клиентов. Формат строки: "username port"
+# Список текущих чат-клиентов. Key-Value БД формата port: username
+peers_db = DictDB("peers.txt")
 
 stop = False # Нужно ли останавливать потоки
 peers = {} # Список чат-клиентов в сети
@@ -33,35 +35,6 @@ class ChatPeer:
     port = None # Номер слушающего сокета
     socket = None # Открытый сокет к серверу этого пира
 
-class MessageConsole:
-    """ Класс для работы с консолью чата из нескольких потоков. """
-
-    current_input = "" # Текущие символы в строке ввода сообщения
-
-    def __init__(self, username):
-        self.username = username # Имя нашего локального юзера
-
-    def input(self):
-        sys.stdout.write(PROMT % self.username)
-        sys.stdout.flush()
-        while True:
-            sym = sys.stdin.read(1)
-            if sym == "\n":
-                result = self.current_input
-                self.current_input = ""
-                return result
-            else:
-                self.current_input += sym
-
-    def restore_input_line(self):
-        sys.stdout.write(PROMT % self.username + current_input + "\n")
-
-        sys.stdout.flush()
-
-    def print(self, text):
-        print("\n" + text)
-        #self.restore_input_line()
-
 def create_socket(port):
     sock = socket.socket(socket.AF_INET)
     sock.connect(("localhost", port))
@@ -78,7 +51,6 @@ def input_message_thread():
     """ Тред для ввода и рассылки сообщений. """
     while not stop:
         message = input()
-        #input(PROMT % username)
         broadcast(Event(
             event_type="MESSAGE", username=username, message=message))
 
@@ -95,10 +67,8 @@ def server_thread(sock):
 
     def process_event(event):
         if event.event_type == "REGISTER":
-            print("reg1")
             port = event.server_port
             socket = create_socket(port)
-            print("reg2")
             peers[port] = ChatPeer(
                 username=event.username, server_port=port, socket=socket)
             print("Пользователь %s вошел в чат." % event.username)
@@ -132,8 +102,7 @@ def server_thread(sock):
 def input_username():
     """Определяем имя пользователя."""
 
-    used_usernames = \
-        [peer.split()[0] for peer in open(PEERS_PATH, "r").readlines()]
+    used_usernames = peers_db.keys()
 
     while True:
         username = input("Введите логин: ")
@@ -147,54 +116,56 @@ def input_username():
 
     return username
 
-def connect_to_peers():
-    """ Соединяемся с уже открытыми чат-клиентами. """
-    lines = open(PEERS_PATH, "r").readlines()
-
-    for line in lines:
-        username, port = line.split()
-        port = int(port)
-        socket = create_socket(port)
-        peers[port] = ChatPeer(username = username,
-            port = port,
-            socket = socket)
-
-def prepare(server_port):
+def connect_to_peers(server_port):
+    """ Соединяемся с уже открытыми чат-клиентами и регистрируемся в сети. """
 
     # Соединяемся с пирами записанными в файле
-    connect_to_peers()
+
+    for port, user in list(peers_db.items()):
+        port = int(port)
+        try:
+            socket = create_socket(port)
+            peers[port] = ChatPeer(username = user,
+                port = port,
+                socket = socket)
+
+        except ConnectionError:
+            # Такого пира уже нет в сети
+            del peers_db[str(port)]
 
     # Добавляем себя в список пиров
-    open(PEERS_PATH, "a").write("%s %d\n" % (username, server_port))
+    peers_db[server_port] = username
 
     # Представляемся другим клиентам
     broadcast(Event(
         event_type="REGISTER", username=username, server_port = server_port))
 
+
 def shutdown(server_port):
     # Удаляемся из списка пиров
 
-    file = open(PEERS_PATH, "r+")
-    another_peers = \
-        [line for line in file.readlines() 
-         if " "+str(server_port) not in line]
-
-    file.seek(0)
-    file.write("\n".join(another_peers))
-    file.truncate()
+    if str(server_port) in peers_db:
+        del peers_db[str(server_port)]
 
     # Уведомляем всех о нашем закрытии
     broadcast(Event(event_type="LEAVE", server_port=server_port))
 
+    # Останавливаемся
+    stop = True
+    sock.close()  
+    for thread in threads:
+        thread.cancel()
+    executor.shutdown(wait=False)
+
 if __name__ == "__main__":
 
-    executor = ThreadPoolExecutor()
+    executor = ThreadPoolExecutor(max_workers=100)
     port = None
 
     try:
+        
         # Спрашиваем имя юзера
         username = input_username()
-        console = MessageConsole(username)
         
         # Поднимаем сервер для приема сообщений
         sock = socket.socket()
@@ -203,7 +174,7 @@ if __name__ == "__main__":
         port = sock.getsockname()[1]
 
         # Представляемся пирам
-        prepare(port)
+        connect_to_peers(port)
 
         # Запускаем прием и отправку сообщений
         input_future = executor.submit(input_message_thread)
@@ -211,14 +182,9 @@ if __name__ == "__main__":
         threads.extend([server_future, input_future])
         wait([server_future, input_future])
 
-    except (KeyboardInterrupt, SystemExit):
+    except (KeyboardInterrupt):
         print("Всего хорошего.")
     finally:
-        # Останавливаемся
-        stop = True
-        sock.close()
         shutdown(port)
-        for thread in threads:
-            thread.cancel()
-        executor.shutdown(wait=False)
-        os._exit(0) #%HACK
+        if os.name != "nt":
+            os._exit(0)
